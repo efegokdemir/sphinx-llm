@@ -429,6 +429,7 @@ def test_direct_suppression_does_not_hide_unrelated_warnings(tmp_path):
 def test_failed_child_unknown_warnings_are_relayed_only_once(tmp_path, parallel):
     result, _ = _build(tmp_path, fail_child=True, parallel=parallel)
 
+    assert result.returncode == 1
     output = _output(result)
     assert output.count("unknown node type: <abbreviation:") == 1
     assert output.count("unknown node type: <centered:") == 1

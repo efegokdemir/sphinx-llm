@@ -264,6 +264,21 @@ def test_combine_builds_with_exception(markdown_app):
     generator.combine_builds(app, Exception("fail"))
 
 
+def test_combine_builds_without_markdown_process_fails_build(
+    markdown_app, tmp_path: Path
+):
+    app = markdown_app
+    app.statuscode = 0
+    generator = MarkdownGenerator(app)
+    generator.md_build_dir = tmp_path / "_markdown_build"
+    generator.md_build_dir.mkdir()
+
+    generator.combine_builds(app, None)
+
+    assert app.statuscode == 1
+    assert not generator.md_build_dir.exists()
+
+
 def test_combine_builds_terminates_orphan_subprocess_on_exception(markdown_app):
     """Test that a failed primary build terminates a running markdown sub-build."""
     app = markdown_app

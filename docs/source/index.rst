@@ -40,6 +40,10 @@ pages. No model or API key is needed for this workflow. To generate summaries
 with a model, install ``sphinx-llm[gen]`` and follow the configuration instructions
 in the README.
 
+If the Markdown sub-build fails, ``sphinx-build`` exits with a non-zero status.
+CI and deployment scripts can use that status to avoid treating incomplete
+``llms.txt`` output as a successful documentation build.
+
 Build this project's documentation
 ----------------------------------
 

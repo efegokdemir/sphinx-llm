@@ -487,9 +487,12 @@ class MarkdownGenerator:
             return
 
         if not self.md_build_process:
-            logger.warning(
-                "Markdown build process not found, skipping build output combination"
+            logger.error(
+                "Markdown build process not found; generated Markdown output is incomplete"
             )
+            app.statuscode = max(app.statuscode, 1)
+            if self.md_build_dir and self.md_build_dir.exists():
+                shutil.rmtree(self.md_build_dir)
             return
 
         if self.md_build_process.poll() is None:
@@ -510,6 +513,7 @@ class MarkdownGenerator:
             self.app.statuscode = 1
         try:
             if self.md_build_process.returncode != 0:
+                app.statuscode = max(app.statuscode, 1)
                 logger.error(
                     f"Markdown build subprocess failed with return code {self.md_build_process.returncode},"
                 )
