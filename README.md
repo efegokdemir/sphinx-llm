@@ -380,6 +380,13 @@ directory. It lists each effective summary, its origin, target, consuming
 source locations, and generated-summary metadata without endpoints, API-key
 environment-variable names, or credentials.
 
+Use the `sphinx-llm summaries` command from the build output directory to
+review the report. Pass `--report PATH` to read it elsewhere or
+`--format json` for machine-readable output. Generated entries report whether
+the build reused a cache entry, generated a new summary, seeded one from a
+legacy directive, or found a miss or stale entry. Older reports without cache
+status remain readable and are labelled `unknown`.
+
 #### Docref styling
 
 By default, a `docref` title is prefixed with `See also:`, and its link uses

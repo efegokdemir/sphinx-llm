@@ -280,11 +280,14 @@ def _generated_record(
     }
 
 
-def _effective_generated(cache_record: dict[str, Any]) -> dict[str, Any]:
+def _effective_generated(
+    cache_record: dict[str, Any], *, cache_status: str
+) -> dict[str, Any]:
     return {
         "target": cache_record["target"],
         "summary": cache_record["summary"],
         "origin": "generated",
+        "cache_status": cache_status,
         "fingerprint": cache_record["fingerprint"],
         "provider": cache_record["provider"],
         "model": cache_record["model"],
@@ -353,6 +356,7 @@ def update_summaries(app: Sphinx, env) -> None:
                     "target": target,
                     "summary": f"See {target}.",
                     "origin": "fallback",
+                    "cache_status": "not_applicable",
                 }
                 continue
         doctree, contents = target_data[target]
@@ -383,7 +387,10 @@ def update_summaries(app: Sphinx, env) -> None:
         target, contents, settings = group_details[summary_id]
         fingerprint = _fingerprint(target, contents, settings)
         cache_record = cache.get(summary_id)
-        if not cache_record or cache_record.get("fingerprint") != fingerprint:
+        if cache_record and cache_record.get("fingerprint") == fingerprint:
+            cache_status = "hit"
+        else:
+            cache_status = "stale" if cache_record else "miss"
             cache_record = _legacy_seed(
                 grouped_requests,
                 target=target,
@@ -391,6 +398,8 @@ def update_summaries(app: Sphinx, env) -> None:
                 fingerprint=fingerprint,
                 settings=settings,
             )
+            if cache_record is not None:
+                cache_status = "seeded"
             if cache_record is None and settings.enabled:
                 logger.info(
                     "Generating summary for document %r with %s/%s",
@@ -404,6 +413,7 @@ def update_summaries(app: Sphinx, env) -> None:
                     fingerprint=fingerprint,
                     settings=settings,
                 )
+                cache_status = "generated"
             if cache_record is not None:
                 cache[summary_id] = cache_record
                 shared_cache[f"docref:{summary_id}"] = cache_record
@@ -420,12 +430,15 @@ def update_summaries(app: Sphinx, env) -> None:
 
         for request in grouped_requests:
             if cache_record and cache_record.get("fingerprint") == fingerprint:
-                effective[request["request_id"]] = _effective_generated(cache_record)
+                effective[request["request_id"]] = _effective_generated(
+                    cache_record, cache_status=cache_status
+                )
             else:
                 effective[request["request_id"]] = {
                     "target": target,
                     "summary": _content_fallback(target_data[target][0], target),
                     "origin": "fallback",
+                    "cache_status": cache_status,
                 }
 
     active_ids = set(automatic)
@@ -586,6 +599,7 @@ def _report_summaries(env) -> list[dict[str, Any]]:
         if selected is None:
             continue
         entry = dict(selected)
+        entry.setdefault("cache_status", "not_applicable")
         identity = json.dumps(entry, sort_keys=True, separators=(",", ":"))
         report_entry = grouped.setdefault(identity, {**entry, "consumers": []})
         report_entry["consumers"].append(

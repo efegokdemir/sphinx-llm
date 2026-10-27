@@ -30,6 +30,9 @@ dependencies = [
     "sphinx>=5.1",
 ]
 
+[project.scripts]
+sphinx-llm = "sphinx_llm.cli:main"
+
 [project.optional-dependencies]
 docs = ["myst-parser>=1"]
 gen = ["openai>=1.55.3"]

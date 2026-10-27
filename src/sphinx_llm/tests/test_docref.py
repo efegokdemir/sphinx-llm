@@ -124,6 +124,7 @@ def test_automatic_summaries_are_deduplicated_and_sources_are_unchanged(
     assert summary["target"] == "target"
     assert summary["provider"] == "openai-compatible"
     assert summary["model"] == ""
+    assert summary["cache_status"] == "generated"
     assert len(summary["fingerprint"]) == 64
     assert len(summary["consumers"]) == 2
     assert summary["consumers"][0]["source"] == "index.rst"
@@ -144,7 +145,14 @@ def test_automatic_summaries_are_deduplicated_and_sources_are_unchanged(
 
 
 @pytest.mark.parametrize(
-    ("directive", "target", "enabled", "expected", "origin"),
+    (
+        "directive",
+        "target",
+        "enabled",
+        "expected",
+        "origin",
+        "expected_cache_status",
+    ),
     [
         (
             ".. docref:: target\n\n   A permanent reviewed summary.\n",
@@ -152,6 +160,7 @@ def test_automatic_summaries_are_deduplicated_and_sources_are_unchanged(
             True,
             "A permanent reviewed summary.",
             "directive",
+            "not_applicable",
         ),
         (
             ".. docref:: target\n",
@@ -159,6 +168,7 @@ def test_automatic_summaries_are_deduplicated_and_sources_are_unchanged(
             True,
             "Target metadata.",
             "html_meta",
+            "not_applicable",
         ),
         (
             ".. docref:: target\n",
@@ -166,6 +176,7 @@ def test_automatic_summaries_are_deduplicated_and_sources_are_unchanged(
             False,
             "Target body used as a local fallback.",
             "fallback",
+            "miss",
         ),
     ],
 )
@@ -180,6 +191,7 @@ def test_override_precedence_and_disabled_fallback(
     enabled,
     expected,
     origin,
+    expected_cache_status,
 ):
     index = f"Index\n=====\n\n.. toctree::\n   :hidden:\n\n   target\n\n{directive}"
     source_dir = docref_project(tmp_path, index=index, target=target)
@@ -195,6 +207,7 @@ def test_override_precedence_and_disabled_fallback(
     [summary] = _report(output_dir)["summaries"]
     assert summary["summary"] == expected
     assert summary["origin"] == origin
+    assert summary["cache_status"] == expected_cache_status
     assert "provider" not in summary
     assert "model" not in summary
 
@@ -393,6 +406,7 @@ def test_incremental_cache_hit_and_target_content_invalidation(
     )
     assert cached_calls == []
     assert _report(output_dir)["summaries"][0]["summary"] == "Generated summary 1."
+    assert _report(output_dir)["summaries"][0]["cache_status"] == "hit"
 
     target = source_dir / "target.rst"
     target.write_text(
@@ -413,7 +427,31 @@ def test_incremental_cache_hit_and_target_content_invalidation(
     assert len(invalidated_calls) == 1
     assert "The target content has now changed." in invalidated_calls[0][1]
     assert _report(output_dir)["summaries"][0]["summary"] == "Regenerated 1."
+    assert _report(output_dir)["summaries"][0]["cache_status"] == "generated"
     assert "Regenerated 1." in (output_dir / "index.html").read_text(encoding="utf-8")
+
+
+def test_report_marks_stale_cache_when_generation_is_disabled(
+    fake_summary_generator, build_sphinx_app, docref_project, tmp_path, monkeypatch
+):
+    source_dir = docref_project(tmp_path, index=_automatic_index())
+    calls: list = []
+    monkeypatch.setattr(docref, "generate_summary", fake_summary_generator(calls))
+    build_sphinx_app(source_dir, confoverrides={"llms_txt_summary_enabled": True})
+
+    target = source_dir / "target.rst"
+    target.write_text("Target\n======\n\nUpdated content.\n", encoding="utf-8")
+    newer = time.time() + 60
+    os.utime(target, (newer, newer))
+    _, output_dir, _ = build_sphinx_app(
+        source_dir,
+        freshenv=False,
+        confoverrides={"llms_txt_summary_enabled": False},
+    )
+
+    [summary] = _report(output_dir)["summaries"]
+    assert summary["origin"] == "fallback"
+    assert summary["cache_status"] == "stale"
 
 
 @pytest.mark.parametrize(
@@ -565,6 +603,7 @@ def test_legacy_hash_seeds_cache_without_modifying_source(
     [summary] = _report(output_dir)["summaries"]
     assert summary["origin"] == "generated"
     assert summary["model"] == "legacy-model"
+    assert summary["cache_status"] == "seeded"
 
 
 def test_environment_configuration_and_report_do_not_expose_secrets(
