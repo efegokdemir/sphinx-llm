@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from enum import Enum
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import docutils.nodes
 from sphinx.application import Sphinx
@@ -56,6 +57,7 @@ UNKNOWN_NODE_WARNING_PATTERN = re.compile(
     r"(?P<message>unknown node type: .+)$"
 )
 SUMMARY_CACHE_VERSION = 1
+STATICMCP_PROTOCOL_VERSION = "2025-06-18"
 SITEMAP_TEXT_TRANSLATION = str.maketrans(
     {
         "&": "&amp;",
@@ -138,6 +140,36 @@ def _serialize_sitemap_entry(
     if description is not None:
         entry += f": {_serialize_sitemap_text(extract_prose(description))}"
     return entry
+
+
+def _staticmcp_resource_path(uri: str) -> PurePosixPath:
+    """Map a StaticMCP resource URI to its encoded JSON response path."""
+    scheme_separator = uri.find("://")
+    if scheme_separator < 1:
+        raise ExtensionError(f"Invalid StaticMCP resource URI: {uri!r}")
+
+    resource_path = unquote(uri[scheme_separator + 3 :])
+    encoded_parts = []
+    for part in resource_path.split("/"):
+        normalized = unicodedata.normalize("NFD", part)
+        normalized = "".join(
+            character
+            for character in normalized
+            if unicodedata.category(character) != "Mn"
+        ).lower()
+        encoded = "".join(
+            character if character in "abcdefghijklmnopqrstuvwxyz0123456789-_" else "_"
+            for character in normalized
+        )
+        if len(encoded) > 200:
+            digest = hashlib.sha256(part.encode("utf-8")).hexdigest()[:16]
+            encoded = f"{encoded[:183]}_{digest}"
+        encoded_parts.append(encoded or "_")
+
+    if not encoded_parts:
+        raise ExtensionError(f"StaticMCP resource URI has no path: {uri!r}")
+    encoded_parts[-1] += ".json"
+    return PurePosixPath("resources", *encoded_parts)
 
 
 def _published_html_path(app: Sphinx, docname: str) -> PurePosixPath:
@@ -520,6 +552,9 @@ class MarkdownGenerator:
             # Copy markdown files to the main output directory
             self.copy_markdown_files()
 
+            if getattr(self.app.config, "llms_txt_staticmcp_enabled", False):
+                self.create_staticmcp_files()
+
             # Concatenate all markdown files into llms-full.txt
             self._generated_llms_full_path = None
             if getattr(self.app.config, "llms_txt_full_build", False):
@@ -745,6 +780,81 @@ class MarkdownGenerator:
             logger.info(
                 f"Excluded {num_excluded} documents from llms.txt and llms-full.txt"
             )
+
+    def create_staticmcp_files(self) -> None:
+        """Write StaticMCP manifests and Markdown resource responses."""
+        outdir = Path(self.outdir).resolve()
+        resources = []
+        plans: list[tuple[PurePosixPath, dict[str, str], str]] = []
+        owners: dict[PurePosixPath, str] = {}
+
+        for markdown_file in sorted(self.generated_markdown_files):
+            resolved_file = markdown_file.resolve()
+            try:
+                relative_path = resolved_file.relative_to(outdir)
+            except ValueError as exc:
+                raise ExtensionError(
+                    "StaticMCP Markdown resources must stay within the build directory"
+                ) from exc
+
+            uri = f"file://{quote(relative_path.as_posix(), safe='/-._~')}"
+            resource_path = _staticmcp_resource_path(uri)
+            previous_uri = owners.get(resource_path)
+            if previous_uri is not None:
+                raise ExtensionError(
+                    "StaticMCP resource URIs "
+                    f"{previous_uri!r} and {uri!r} resolve to the same file "
+                    f"{resource_path.as_posix()!r}"
+                )
+            owners[resource_path] = uri
+
+            entry = {
+                "uri": uri,
+                "name": self.extract_title_from_markdown(resolved_file),
+                "description": self.get_page_description(resolved_file),
+                "mimeType": "text/markdown",
+            }
+            plans.append(
+                (resource_path, entry, resolved_file.read_text(encoding="utf-8"))
+            )
+            resources.append(entry)
+
+        for resource_path, entry, content in plans:
+            destination = outdir.joinpath(*resource_path.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(
+                    {
+                        "uri": entry["uri"],
+                        "mimeType": entry["mimeType"],
+                        "text": content,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        index_path = outdir / "resources" / "index.json"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(
+            json.dumps({"resources": resources}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        manifest = {
+            "protocolVersion": STATICMCP_PROTOCOL_VERSION,
+            "serverInfo": {
+                "name": getattr(self.app.config, "project", "Sphinx documentation"),
+                "version": getattr(self.app.config, "release", "") or __version__,
+            },
+            "capabilities": {"resources": resources, "tools": []},
+        }
+        (outdir / "mcp.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def _target_paths_for_docname(
         self, docname: str
@@ -1484,6 +1594,7 @@ def setup(app: Sphinx) -> dict[str, Any]:
     app.add_config_value("llms_txt_full_build", False, "env")
     app.add_config_value("llms_txt_nested_enabled", True, "env")
     app.add_config_value("llms_txt_exclude", [], "env")
+    app.add_config_value("llms_txt_staticmcp_enabled", False, "env")
     app.add_config_value("llms_txt_override_source", "", "env")
     app.add_config_value(
         SUPPRESS_UNKNOWN_NODE_WARNINGS_CONFIG,
