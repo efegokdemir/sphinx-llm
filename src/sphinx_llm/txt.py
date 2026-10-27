@@ -23,10 +23,11 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
+from html.parser import HTMLParser
 from importlib.metadata import PackageNotFoundError, metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import docutils.nodes
 from sphinx.application import Sphinx
@@ -56,6 +57,8 @@ UNKNOWN_NODE_WARNING_PATTERN = re.compile(
     r"(?P<message>unknown node type: .+)$"
 )
 SUMMARY_CACHE_VERSION = 1
+OUTPUT_MANIFEST_FILENAME = ".sphinx-llm-generated-files.json"
+OUTPUT_MANIFEST_VERSION = 1
 SITEMAP_TEXT_TRANSLATION = str.maketrans(
     {
         "&": "&amp;",
@@ -270,6 +273,30 @@ class MarkdownLayout(str, Enum):
     REPLACE = "replace"
 
 
+class _MarkdownDiscoveryLinkParser(HTMLParser):
+    """Collect published Markdown links from existing HTML pages."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+        self.index_hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "link":
+            return
+        attributes = dict(attrs)
+        if (
+            "alternate" in attributes.get("rel", "").split()
+            and attributes.get("type") == "text/markdown"
+            and attributes.get("href")
+        ):
+            self.hrefs.append(attributes["href"])
+        if "describedby" in attributes.get("rel", "").split() and attributes.get(
+            "href"
+        ):
+            self.index_hrefs.append(attributes["href"])
+
+
 SUFFIX_MODE_ALIASES = {"both": "auto"}
 SUFFIX_MODES = ("auto", "append", "replace", "file-suffix", "url-suffix")
 SUPPORTED_SUFFIX_MODES = (*SUFFIX_MODES, *SUFFIX_MODE_ALIASES)
@@ -366,6 +393,8 @@ class MarkdownGenerator:
         self._summary_cache: dict[str, dict[str, str]] | None = None
         self._loaded_summary_cache_path: Path | None = None
         self._generated_llms_full_path: Path | None = None
+        self._generated_output_files: set[str] = set()
+        self._manifest_update_needed = False
         # nested llms.txt indexes, computed once per build for the discovery
         # metadata of all pages
         self._llms_txt_index_paths: set[PurePosixPath] | None = None
@@ -417,14 +446,19 @@ class MarkdownGenerator:
 
     def build_llms_txt(self, app: Sphinx):
         """Generate markdown files using sphinx_markdown_builder and concatenate them into llms.txt."""
+        self.outdir = Path(app.builder.outdir).resolve()
+        self.md_build_dir = self.outdir / "_markdown_build"
+        self._generated_output_files = self._read_generated_output_manifest()
+        self._manifest_update_needed = False
+
         if not getattr(self.app.config, "llms_txt_enabled", True):
+            self._connect_output_cleanup()
             logger.info(
                 "llms.txt generation is disabled (llms_txt_enabled=False), skipping..."
             )
             return
 
-        self.outdir = Path(app.builder.outdir)
-        self.md_build_dir = self.outdir / "_markdown_build"
+        self._manifest_update_needed = True
         self.parallel = getattr(self.app.config, "llms_txt_build_parallel", True)
         self.markdown_docinfo = getattr(
             self.app.config, "llms_txt_markdown_docinfo", False
@@ -440,10 +474,14 @@ class MarkdownGenerator:
                 DEPRECATED_SUFFIX_MODES[configured_suffix_mode],
             )
 
-        if app.builder and app.builder.name == "markdown":
+        if app.builder and app.builder.name in {
+            "markdown",
+            SphinxLlmMarkdownBuilder.name,
+        }:
             return
 
         if not app.builder or app.builder.name not in ["html", "dirhtml"]:
+            self._connect_output_cleanup()
             logger.info(
                 "llms.txt generation only works with HTML builders (html or dirhtml), skipping..."
             )
@@ -462,6 +500,266 @@ class MarkdownGenerator:
             self.app.connect("build-finished", self.build_markdown_files, priority=100)
         # Once the primary build is finished, combine the markdown files
         self.app.connect("build-finished", self.combine_builds, priority=101)
+        self.app.connect(
+            "build-finished", self._save_generated_output_manifest, priority=102
+        )
+
+    def _connect_output_cleanup(self) -> None:
+        """Remove prior generated files only after a successful cleanup build."""
+        self.app.connect(
+            "build-finished", self._remove_previous_outputs_after_build, priority=101
+        )
+        self.app.connect(
+            "build-finished", self._save_generated_output_manifest, priority=102
+        )
+
+    @property
+    def _output_manifest_path(self) -> Path:
+        """Return the manifest that records files owned by this extension."""
+        outdir_id = hashlib.sha256(os.fsencode(self.outdir)).hexdigest()[:16]
+        return Path(self.app.doctreedir) / f"{OUTPUT_MANIFEST_FILENAME}.{outdir_id}"
+
+    def _remove_previous_outputs_after_build(
+        self, app: Sphinx, exception: Exception | None
+    ) -> None:
+        """Remove previous generated files after the primary build succeeds."""
+        if exception is not None:
+            return
+        self._clear_previous_generated_outputs()
+        self._manifest_update_needed = True
+
+    def _clear_previous_generated_outputs(self) -> None:
+        """Remove only files recorded by an earlier sphinx-llm build."""
+        previous_outputs = set(self._generated_output_files)
+        self._generated_output_files = set()
+        for name in previous_outputs:
+            relative_path = PurePosixPath(name)
+            output_path = self.outdir.joinpath(*relative_path.parts)
+            if output_path.is_symlink() or output_path.is_file():
+                try:
+                    output_path.unlink()
+                except OSError as error:
+                    raise ExtensionError(
+                        f"Could not remove previous sphinx-llm output {name!r}"
+                    ) from error
+
+    def _read_generated_output_manifest(self) -> set[str]:
+        """Read and validate the previous generated-file manifest."""
+        manifest_path = self._output_manifest_path
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return self._legacy_generated_outputs()
+        except (OSError, TypeError, ValueError) as error:
+            raise ExtensionError(
+                f"Could not read sphinx-llm output manifest at {manifest_path}"
+            ) from error
+
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != OUTPUT_MANIFEST_VERSION
+            or not isinstance(payload.get("files"), list)
+        ):
+            raise ExtensionError(
+                f"Invalid sphinx-llm output manifest at {manifest_path}"
+            )
+
+        filenames = set()
+        for name in payload["files"]:
+            if not isinstance(name, str):
+                raise ExtensionError(
+                    f"Invalid path in sphinx-llm output manifest at {manifest_path}"
+                )
+            relative_path = PurePosixPath(name)
+            windows_path = PureWindowsPath(name)
+            if (
+                not relative_path.parts
+                or relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or windows_path.is_absolute()
+                or windows_path.drive
+                or ".." in windows_path.parts
+                or "\\" in name
+                or relative_path.as_posix() != name
+            ):
+                raise ExtensionError(
+                    f"Unsafe path in sphinx-llm output manifest at {manifest_path}"
+                )
+
+            output_path = self.outdir.joinpath(*relative_path.parts)
+            try:
+                output_path.parent.resolve().relative_to(self.outdir)
+            except ValueError as error:
+                raise ExtensionError(
+                    f"Unsafe path in sphinx-llm output manifest at {manifest_path}"
+                ) from error
+            filenames.add(name)
+        return filenames
+
+    def _legacy_generated_outputs(self) -> set[str]:
+        """Find outputs from builds created before the manifest was introduced."""
+        if not self.outdir.is_dir():
+            return set()
+
+        discovered_markdown: list[tuple[Path, str]] = []
+        discovered_indexes: list[tuple[Path, str]] = []
+        for html_path in self.outdir.rglob("*.html"):
+            if "_markdown_build" in html_path.relative_to(self.outdir).parts:
+                continue
+            parser = _MarkdownDiscoveryLinkParser()
+            try:
+                parser.feed(html_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                continue
+            discovered_markdown.extend((html_path, href) for href in parser.hrefs)
+            discovered_indexes.extend((html_path, href) for href in parser.index_hrefs)
+
+        if not discovered_markdown and not discovered_indexes:
+            return set()
+
+        outputs = set()
+        root_index = self.outdir / "llms.txt"
+        root_lists_full = False
+        if root_index.is_file():
+            outputs.add("llms.txt")
+            try:
+                root_lists_full = "[llms-full.txt]" in root_index.read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeError):
+                pass
+
+        def local_output_path(html_path: Path, href: str) -> Path | None:
+            parsed = urlsplit(href)
+            if not parsed.path:
+                return None
+            if parsed.scheme or parsed.netloc:
+                base = urlsplit(self._markdown_http_base())
+                base_path = base.path.rstrip("/")
+                if (
+                    parsed.scheme != base.scheme
+                    or parsed.netloc != base.netloc
+                    or not parsed.path.startswith(f"{base_path}/")
+                ):
+                    return None
+                relative_uri = unquote(parsed.path[len(base_path) :].lstrip("/"))
+                candidate = self.outdir / relative_uri
+            else:
+                relative_uri = unquote(parsed.path)
+                candidate = (
+                    self.outdir / relative_uri.lstrip("/")
+                    if relative_uri.startswith("/")
+                    else html_path.parent / relative_uri
+                )
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(self.outdir)
+            except ValueError:
+                return None
+            return resolved
+
+        for html_path, href in discovered_indexes:
+            index_path = local_output_path(html_path, href)
+            if index_path is not None and index_path.is_file():
+                for parent in index_path.parents:
+                    parent_index = parent / "llms.txt"
+                    if parent_index.is_file():
+                        outputs.add(parent_index.relative_to(self.outdir).as_posix())
+                    if parent == self.outdir:
+                        break
+
+        full_index = self.outdir / "llms-full.txt"
+        if full_index.is_file() and (
+            getattr(self.app.config, "llms_txt_full_build", False) or root_lists_full
+        ):
+            outputs.add("llms-full.txt")
+
+        suffix_mode = normalize_suffix_mode(
+            getattr(self.app.config, "llms_txt_suffix_mode", "auto")
+        )
+        builder_name = getattr(self.app.builder, "name", "html")
+        for html_path, href in discovered_markdown:
+            markdown_path = local_output_path(html_path, href)
+            if markdown_path is None:
+                continue
+            if markdown_path.is_file():
+                outputs.add(markdown_path.relative_to(self.outdir).as_posix())
+
+            if markdown_path.name.endswith(".html.md"):
+                stem = markdown_path.name[: -len(".html.md")]
+                if suffix_mode == "auto":
+                    replacement_path = markdown_path.with_name(f"{stem}.md")
+                    if replacement_path.is_file():
+                        outputs.add(
+                            replacement_path.relative_to(self.outdir).as_posix()
+                        )
+
+                parent_relative = markdown_path.parent.relative_to(self.outdir)
+                if (
+                    builder_name == "dirhtml"
+                    and suffix_mode in {"auto", "append"}
+                    and parent_relative.parts
+                    and markdown_path.name == "index.html.md"
+                ):
+                    no_slash_path = markdown_path.parent.parent / (
+                        f"{markdown_path.parent.name}.md"
+                    )
+                    if no_slash_path.is_file():
+                        outputs.add(no_slash_path.relative_to(self.outdir).as_posix())
+
+        return outputs
+
+    def _record_generated_output(self, path: Path) -> None:
+        """Record one generated file using a path relative to the HTML output."""
+        try:
+            relative_path = path.relative_to(self.outdir)
+        except ValueError as error:
+            raise ExtensionError(
+                f"sphinx-llm output path escapes the build directory: {path}"
+            ) from error
+        if not relative_path.parts or ".." in relative_path.parts:
+            raise ExtensionError(
+                f"sphinx-llm output path escapes the build directory: {path}"
+            )
+        self._generated_output_files.add(relative_path.as_posix())
+
+    def _save_generated_output_manifest(
+        self, app: Sphinx | None = None, exception: Exception | None = None
+    ) -> None:
+        """Persist the generated-file list for cleanup on the next build."""
+        if not self._manifest_update_needed:
+            return
+        manifest_path = self._output_manifest_path
+        temporary_path: Path | None = None
+        try:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=manifest_path.parent,
+                prefix=f"{manifest_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                json.dump(
+                    {
+                        "version": OUTPUT_MANIFEST_VERSION,
+                        "files": sorted(self._generated_output_files),
+                    },
+                    temporary_file,
+                )
+                temporary_file.write("\n")
+            os.replace(temporary_path, manifest_path)
+        except OSError as error:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise ExtensionError(
+                f"Could not write sphinx-llm output manifest at {manifest_path}"
+            ) from error
 
     def combine_builds(self, app: Sphinx, exception: Exception | None):
         """Combine the markdown files into llms-full.txt and llms.txt and merge the build outputs together."""
@@ -719,6 +1017,7 @@ class MarkdownGenerator:
             # Write the file with links for its published location.
             for layout, target_file in target_files.items():
                 target_file.parent.mkdir(parents=True, exist_ok=True)
+                self._record_generated_output(target_file)
                 target_file.write_text(
                     self._materialize_links(
                         content,
@@ -810,6 +1109,7 @@ class MarkdownGenerator:
     def build_llms_full_txt(self) -> Path:
         # Concatenate all markdown files into llms-full.txt
         llms_txt_path = self.outdir / "llms-full.txt"
+        self._record_generated_output(llms_txt_path)
         with open(llms_txt_path, "w", encoding="utf-8") as llms_txt:
             # Sort files to ensure index.html.md comes first
             sorted_files = sorted(
@@ -871,6 +1171,7 @@ class MarkdownGenerator:
         content = source_file.read_text(encoding="utf-8")
         _, primary_layout = self._target_paths_for_docname(docname)
         llms_txt_path = self.outdir / "llms.txt"
+        self._record_generated_output(llms_txt_path)
         llms_txt_path.write_text(
             self._materialize_links(
                 content,
@@ -950,6 +1251,7 @@ class MarkdownGenerator:
     ) -> None:
         """Write the common page listing for one Markdown sitemap."""
         llms_txt_path.parent.mkdir(parents=True, exist_ok=True)
+        self._record_generated_output(llms_txt_path)
         with open(llms_txt_path, "w", encoding="utf-8") as sitemap:
             project_title = getattr(self.app.config, "project", "Documentation")
             sitemap.write(f"# {project_title}\n\n")
@@ -1476,7 +1778,7 @@ def setup(app: Sphinx) -> dict[str, Any]:
     if app.tags.has("sphinx_llm_markdown"):
         app.setup_extension("sphinx_markdown_builder")
         app.add_builder(SphinxLlmMarkdownBuilder)
-    app.add_config_value("llms_txt_enabled", True, "")
+    app.add_config_value("llms_txt_enabled", True, "env")
     app.add_config_value("llms_txt_description", "", "env")
     app.add_config_value("llms_txt_build_parallel", True, "env")
     app.add_config_value("llms_txt_markdown_docinfo", False, "env")

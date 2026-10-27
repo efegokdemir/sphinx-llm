@@ -6,6 +6,7 @@ Tests for the sphinx_llm.txt module.
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 import shutil
@@ -1988,6 +1989,76 @@ def test_disabled_builds_do_not_have_discovery_metadata(
     ]
 
 
+@pytest.mark.parametrize("builder", ["html", "dirhtml"])
+def test_disabling_removes_outputs_from_a_previous_build(
+    docs_source_dir, tmp_path: Path, make_sphinx_app, builder: str
+):
+    """A reused output directory contains no stale sphinx-llm artifacts."""
+    output_dir = tmp_path / "build"
+    doctree_dir = tmp_path / "doctrees"
+
+    enabled = make_sphinx_app(
+        srcdir=str(docs_source_dir),
+        outdir=str(output_dir),
+        doctreedir=str(doctree_dir),
+        buildername=builder,
+        confoverrides={
+            "llms_txt_build_parallel": False,
+            "llms_txt_full_build": True,
+        },
+        freshenv=True,
+    )
+    enabled.build()
+    assert (output_dir / "llms.txt").is_file()
+    assert (output_dir / "llms-full.txt").is_file()
+    assert list(output_dir.rglob("*.md"))
+    assert 'rel="alternate"' in (output_dir / "index.html").read_text(encoding="utf-8")
+    [manifest_path] = doctree_dir.glob(".sphinx-llm-generated-files.json.*")
+    manifest_path.unlink()
+
+    disabled = make_sphinx_app(
+        srcdir=str(docs_source_dir),
+        outdir=str(output_dir),
+        doctreedir=str(doctree_dir),
+        buildername=builder,
+        confoverrides={"llms_txt_enabled": False},
+        freshenv=False,
+    )
+    disabled.build()
+
+    assert not list(output_dir.rglob("*.md"))
+    assert not list(output_dir.rglob("llms.txt"))
+    assert not (output_dir / "llms-full.txt").exists()
+    assert 'rel="alternate"' not in (output_dir / "index.html").read_text(
+        encoding="utf-8"
+    )
+    [manifest_path] = doctree_dir.glob(".sphinx-llm-generated-files.json.*")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {"version": 1, "files": []}
+
+
+@pytest.mark.parametrize("unsafe_path", ["../keep.txt", "C:/keep.txt", r"..\keep.txt"])
+def test_output_manifest_cannot_remove_files_outside_the_build(
+    make_markdown_generator, tmp_path: Path, unsafe_path: str
+):
+    """A malformed manifest cannot make cleanup escape the output directory."""
+    output_dir = tmp_path / "build"
+    outside_file = tmp_path / "keep.txt"
+    outside_file.write_text("keep", encoding="utf-8")
+    generator = make_markdown_generator(root=output_dir)
+    generator.outdir = output_dir.resolve()
+    generator.app.doctreedir = tmp_path / "doctrees"
+    generator.app.doctreedir.mkdir()
+    generator._output_manifest_path.write_text(
+        json.dumps({"version": 1, "files": [unsafe_path]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ExtensionError, match="Unsafe path"):
+        generator._read_generated_output_manifest()
+
+    assert outside_file.read_text(encoding="utf-8") == "keep"
+
+
 def test_discovery_metadata_covers_source_pages_not_auxiliary_pages(
     make_sphinx_app, tmp_path: Path
 ):
@@ -2086,11 +2157,14 @@ def test_discovery_metadata_covers_source_pages_not_auxiliary_pages(
 
 
 @pytest.mark.parametrize("builder", ["text", "llms-markdown"])
-def test_unsupported_and_internal_builders_do_not_register_discovery(builder: str):
+def test_unsupported_and_internal_builders_do_not_register_discovery(
+    builder: str, tmp_path: Path
+):
     """Non-HTML and internal Markdown builders remain unchanged."""
     app = MagicMock()
     app.builder.name = builder
     app.builder.outdir = "/tmp/unused"
+    app.doctreedir = tmp_path / "doctrees"
     app.config.llms_txt_enabled = True
     app.config.llms_txt_build_parallel = True
     app.config.llms_txt_suffix_mode = "auto"

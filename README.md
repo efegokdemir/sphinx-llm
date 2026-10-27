@@ -202,7 +202,7 @@ Supported `conf.py` configuration options for `sphinx_llm.txt`.
 <!-- markdownlint-disable MD013 -->
 | **Name** | **Description** | **Type** | **Default** |
 | --- | --- | --- | --- |
-| `llms_txt_enabled` | Enable or disable all llms.txt artefact generation without removing the extension from `conf.py`; audience tags remain available. Use `sphinx-build -D llms_txt_enabled=0` to skip generation on a per-build basis. | `bool` | `True` |
+| `llms_txt_enabled` | Enable or disable all llms.txt artefact generation without removing the extension from `conf.py`; audience tags remain available. Use `sphinx-build -D llms_txt_enabled=0` to disable generation on a per-build basis. Outputs from the previous enabled build are removed from a reused output directory, and HTML is rebuilt without discovery links. | `bool` | `True` |
 | `llms_txt_nested_enabled` | Generate scoped nested `llms.txt` files and discover the most-specific index. Set to `False` for root-only generation and discovery. | `bool` | `True` |
 | `llms_txt_description` | Override the project description set in `llms.txt` | `str` | Uses the project description from `pyproject.toml` by default |
 | `llms_txt_build_parallel` | Build markdown files in parallel to the HTML files. | `bool` | `True` |
