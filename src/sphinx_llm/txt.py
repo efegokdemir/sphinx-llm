@@ -285,15 +285,14 @@ class _MarkdownDiscoveryLinkParser(HTMLParser):
         if tag != "link":
             return
         attributes = dict(attrs)
+        relations = (attributes.get("rel") or "").split()
         if (
-            "alternate" in attributes.get("rel", "").split()
+            "alternate" in relations
             and attributes.get("type") == "text/markdown"
             and attributes.get("href")
         ):
             self.hrefs.append(attributes["href"])
-        if "describedby" in attributes.get("rel", "").split() and attributes.get(
-            "href"
-        ):
+        if "describedby" in relations and attributes.get("href"):
             self.index_hrefs.append(attributes["href"])
 
 

@@ -32,6 +32,35 @@ from sphinx_llm.tests.helpers import (
 from sphinx_llm.txt import MarkdownGenerator, get_llms_txt_index_path
 
 
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<link rel>",
+        '<link rel type="text/markdown" href="page.html.md">',
+        '<link rel href="llms.txt">',
+    ],
+)
+def test_discovery_parser_ignores_valueless_rel_attributes(html: str) -> None:
+    parser = sphinx_llm.txt._MarkdownDiscoveryLinkParser()
+
+    parser.feed(html)
+
+    assert parser.hrefs == []
+    assert parser.index_hrefs == []
+
+
+def test_discovery_parser_keeps_valid_link_relations() -> None:
+    parser = sphinx_llm.txt._MarkdownDiscoveryLinkParser()
+
+    parser.feed(
+        '<link rel="alternate" type="text/markdown" href="page.html.md">'
+        '<link rel="describedby" href="llms.txt">'
+    )
+
+    assert parser.hrefs == ["page.html.md"]
+    assert parser.index_hrefs == ["llms.txt"]
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_extensions_override_loads_markdown_builder(tmp_path: Path, parallel: bool):
     """Extensions enabled on the command line also load in the subprocess."""
@@ -1990,8 +2019,13 @@ def test_disabled_builds_do_not_have_discovery_metadata(
 
 
 @pytest.mark.parametrize("builder", ["html", "dirhtml"])
+@pytest.mark.parametrize("remove_manifest", [False, True])
 def test_disabling_removes_outputs_from_a_previous_build(
-    docs_source_dir, tmp_path: Path, make_sphinx_app, builder: str
+    docs_source_dir,
+    tmp_path: Path,
+    make_sphinx_app,
+    builder: str,
+    remove_manifest: bool,
 ):
     """A reused output directory contains no stale sphinx-llm artifacts."""
     output_dir = tmp_path / "build"
@@ -2014,7 +2048,10 @@ def test_disabling_removes_outputs_from_a_previous_build(
     assert list(output_dir.rglob("*.md"))
     assert 'rel="alternate"' in (output_dir / "index.html").read_text(encoding="utf-8")
     [manifest_path] = doctree_dir.glob(".sphinx-llm-generated-files.json.*")
-    manifest_path.unlink()
+    if remove_manifest:
+        with (output_dir / "index.html").open("a", encoding="utf-8") as html_file:
+            html_file.write("\n<link rel>\n")
+        manifest_path.unlink()
 
     disabled = make_sphinx_app(
         srcdir=str(docs_source_dir),
