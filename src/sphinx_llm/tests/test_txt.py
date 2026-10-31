@@ -193,20 +193,20 @@ def _sitemap_entries(path: Path) -> dict[str, str]:
     return dict(_sitemap_section_entries(path, headings[0]))
 
 
-def test_markdown_output_omits_project_version_by_default(
+def test_markdown_output_includes_project_version_by_default(
     build_versioned_markdown, tmp_path: Path
 ):
-    """Generated Markdown omits project metadata unless explicitly enabled."""
+    """Generated Markdown preserves configured project version by default."""
     markdown = build_versioned_markdown(tmp_path)
-    assert "1.2.3" not in markdown
+    assert '<meta name="version" content="1.2.3"/>' in markdown
 
 
 def test_markdown_output_preserves_project_version_when_enabled(
     build_versioned_markdown, tmp_path: Path
 ):
-    """Projects can opt in to configured Sphinx version metadata."""
+    """Projects can explicitly enable Sphinx project metadata."""
     markdown = build_versioned_markdown(tmp_path, {"llms_txt_markdown_docinfo": True})
-    assert "1.2.3" in markdown
+    assert '<meta name="version" content="1.2.3"/>' in markdown
 
 
 def test_markdown_output_can_disable_project_version(
@@ -214,7 +214,7 @@ def test_markdown_output_can_disable_project_version(
 ):
     """Projects can opt out of project/version metadata in Markdown."""
     markdown = build_versioned_markdown(tmp_path, {"llms_txt_markdown_docinfo": False})
-    assert "1.2.3" not in markdown
+    assert '<meta name="version" content="1.2.3"/>' not in markdown
 
 
 def assert_file_exists_with_content(path: Path) -> None:
@@ -342,7 +342,7 @@ def test_boolean_config_overrides_use_sphinx_cli_values(tmp_path):
         "-D",
         "extensions=sphinx_llm.txt",
         "-D",
-        "markdown_docinfo=0",
+        "markdown_docinfo=1",
     ]
 
 

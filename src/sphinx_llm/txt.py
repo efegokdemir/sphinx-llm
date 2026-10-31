@@ -427,7 +427,7 @@ class MarkdownGenerator:
         self.md_build_dir = self.outdir / "_markdown_build"
         self.parallel = getattr(self.app.config, "llms_txt_build_parallel", True)
         self.markdown_docinfo = getattr(
-            self.app.config, "llms_txt_markdown_docinfo", False
+            self.app.config, "llms_txt_markdown_docinfo", True
         )
         configured_suffix_mode = getattr(
             self.app.config, "llms_txt_suffix_mode", "auto"
@@ -636,10 +636,10 @@ class MarkdownGenerator:
                 f"extensions={','.join(self.app.config.extensions)}",
             ]
 
-            # Include project/version metadata only when explicitly enabled.
+            # Preserve project/version metadata unless the project opts out.
             sphinx_build_cmd += [
                 "-D",
-                f"markdown_docinfo={'1' if getattr(self, 'markdown_docinfo', False) else '0'}",
+                f"markdown_docinfo={'1' if getattr(self, 'markdown_docinfo', True) else '0'}",
             ]
 
             # When building sequentially we can reuse the doctree directory from the primary build
@@ -1479,7 +1479,7 @@ def setup(app: Sphinx) -> dict[str, Any]:
     app.add_config_value("llms_txt_enabled", True, "")
     app.add_config_value("llms_txt_description", "", "env")
     app.add_config_value("llms_txt_build_parallel", True, "env")
-    app.add_config_value("llms_txt_markdown_docinfo", False, "env")
+    app.add_config_value("llms_txt_markdown_docinfo", True, "env")
     app.add_config_value("llms_txt_suffix_mode", "auto", "env")
     app.add_config_value("llms_txt_full_build", False, "env")
     app.add_config_value("llms_txt_nested_enabled", True, "env")

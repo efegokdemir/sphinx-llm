@@ -40,6 +40,18 @@ pages. No model or API key is needed for this workflow. To generate summaries
 with a model, install ``sphinx-llm[gen]`` and follow the configuration instructions
 in the README.
 
+Project version in Markdown
+---------------------------
+
+Sphinx project metadata is included in generated Markdown by default. If your
+``conf.py`` sets ``version = "2.4"``, each generated page contains:
+
+.. code-block:: html
+
+   <meta name="version" content="2.4"/>
+
+Set ``llms_txt_markdown_docinfo = False`` in ``conf.py`` to omit the metadata.
+
 Build this project's documentation
 ----------------------------------
 
